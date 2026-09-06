@@ -89,8 +89,14 @@ spec:
                       must be a positive integer, and must be less than 1000 days
                       (in seconds).
                     maximum: 86400000
+                    minimum: 1
                     type: integer
                 type: object
+                x-kubernetes-validations:
+                - message: namePrefix requires bucketName or bucketId
+                  rule: '!has(self.namePrefix) || size(self.namePrefix) == 0 || (has(self.bucketName)
+                    && size(self.bucketName) > 0) || (has(self.bucketId) && size(self.bucketId)
+                    > 0)'
               writeConnectionSecretToRef:
                 description: Set where operator should save connection credentials.
                 properties:
@@ -141,6 +147,7 @@ spec:
                       must be a positive integer, and must be less than 1000 days
                       (in seconds).
                     maximum: 86400000
+                    minimum: 1
                     type: integer
                 type: object
               bucketId:

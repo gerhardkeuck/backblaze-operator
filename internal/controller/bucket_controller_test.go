@@ -88,6 +88,7 @@ var _ = Describe("Bucket controller", func() {
 		_, err = reconcileBucket(r, "bucket-duplicate")
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("duplicate_bucket_name"))
+		Expect(err.Error()).NotTo(ContainSubstring("Bucket name is already in use"))
 
 		bucket := getBucket("bucket-duplicate")
 		Expect(bucket.Status.Reconciled).To(BeFalse())
@@ -95,7 +96,8 @@ var _ = Describe("Bucket controller", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal(ReasonDuplicateBucketName))
-		Expect(cond.Message).To(ContainSubstring("Bucket name is already in use"))
+		Expect(cond.Message).To(ContainSubstring("duplicate_bucket_name"))
+		Expect(cond.Message).NotTo(ContainSubstring("Bucket name is already in use"))
 
 		Eventually(recorder.Events).Should(Receive(ContainSubstring(ReasonDuplicateBucketName)))
 	})
@@ -164,6 +166,27 @@ var _ = Describe("Bucket controller", func() {
 		_, err = reconcileBucket(r, "bucket-delete-err")
 		Expect(err).NotTo(HaveOccurred())
 		err = k8sClient.Get(ctx, types.NamespacedName{Name: "bucket-delete-err", Namespace: "default"}, &b2v1alpha2.Bucket{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	It("retains the provider bucket when deletionPolicy is Retain", func() {
+		fake := &fakeB2{
+			createBucketResp: &backblaze.Bucket{BucketInfo: &backblaze.BucketInfo{ID: "bucket-id-retain", Name: "bucket-retain"}},
+		}
+		r := newBucketReconciler(fake, nil)
+		bucket := newBucket("bucket-retain")
+		bucket.Spec.DeletionPolicy = "Retain"
+		Expect(k8sClient.Create(ctx, bucket)).To(Succeed())
+		_, err := reconcileBucket(r, bucket.Name)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconcileBucket(r, bucket.Name)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Delete(ctx, getBucket(bucket.Name))).To(Succeed())
+		fake.bucketErr = &backblaze.B2Error{Code: "service_unavailable", Message: "must not be called", Status: 503}
+		_, err = reconcileBucket(r, bucket.Name)
+		Expect(err).NotTo(HaveOccurred())
+		err = k8sClient.Get(ctx, types.NamespacedName{Name: bucket.Name, Namespace: "default"}, &b2v1alpha2.Bucket{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
 })

@@ -17,10 +17,12 @@ type fakeB2 struct {
 	createKeyResp *backblaze.ApplicationKeyResponse
 	createKeyErr  error
 
-	deleteKeyErr    error
-	deletedKeyIds   []string
-	createdBuckets  []string
-	createdKeyNames []string
+	deleteKeyErr       error
+	deletedKeyIds      []string
+	deleteKeyCalls     []string
+	createdBuckets     []string
+	createdKeyNames    []string
+	createdKeyRequests []*backblaze.CreateKeyRequest
 }
 
 var _ B2Client = (*fakeB2)(nil)
@@ -37,6 +39,9 @@ func (f *fakeB2) CreateBucketWithInfo(bucketName string, bucketType backblaze.Bu
 }
 
 func (f *fakeB2) CreateApplicationKey(keyDetails *backblaze.CreateKeyRequest) (*backblaze.ApplicationKeyResponse, error) {
+	requestCopy := *keyDetails
+	requestCopy.Capabilities = append([]string(nil), keyDetails.Capabilities...)
+	f.createdKeyRequests = append(f.createdKeyRequests, &requestCopy)
 	if f.createKeyErr == nil && f.createKeyResp != nil {
 		f.createdKeyNames = append(f.createdKeyNames, keyDetails.KeyName)
 	}
@@ -44,6 +49,7 @@ func (f *fakeB2) CreateApplicationKey(keyDetails *backblaze.CreateKeyRequest) (*
 }
 
 func (f *fakeB2) DeleteApplicationKey(applicationKeyID string) (*backblaze.ApplicationKeyResponse, error) {
+	f.deleteKeyCalls = append(f.deleteKeyCalls, applicationKeyID)
 	if f.deleteKeyErr == nil {
 		f.deletedKeyIds = append(f.deletedKeyIds, applicationKeyID)
 	}

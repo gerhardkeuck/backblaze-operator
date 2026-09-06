@@ -46,6 +46,9 @@ kind: Bucket
 metadata:
   name: my-b2-bucket
 spec:
+  # Use Retain for buckets whose data must survive deletion of this resource.
+  # The default is Delete for compatibility with existing resources.
+  deletionPolicy: Retain
   atProvider:
     acl: private
     bucketLifecycle:
@@ -68,6 +71,9 @@ metadata:
 spec:
   atProvider:
     bucketName: my-b2-bucket
+    # Prefix restrictions require bucketName or bucketId.
+    namePrefix: woodpecker/
+    validDurationInSeconds: 86400
     capabilities:
       - deleteFiles
       - listAllBucketNames
@@ -85,6 +91,17 @@ spec:
       name: new-key
 ```
 The secret will contain `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `bucketName`, `endpoint`, `keyName`.
+
+The operator owns this Secret and verifies it before reporting the Key Ready. A
+missing or invalid owned Secret triggers a revoke-and-recreate rotation because
+Backblaze returns secret key material only at creation time. A Secret owned by
+another resource is never overwritten. If a create request has an ambiguous
+outcome and no Secret receipt exists, the Key fails closed with
+`KeyCreationUncertain`; after verifying and deleting any provider key created by
+that attempt, set `b2.issei.space/retry-creation=true` on the Key to retry.
+
+Bucket server-side encryption is not configurable through this CRD. The
+operator neither inspects nor changes an existing bucket's encryption settings.
 
 ### Learn more
 You can find troubleshooting guides and other useful information in [docs directory](docs/)

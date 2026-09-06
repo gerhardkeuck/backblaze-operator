@@ -146,7 +146,7 @@ func (r *BucketReconciler) createOrUpdateBucket(ctx context.Context, bucket *b2v
 		bucket_b2_exist, bucket_b2_exist_err := r.Backblaze.Bucket(bucket.Name)
 
 		if bucket_b2_exist_err != nil {
-			return fmt.Errorf("unable to fetch Bucket: %v", bucket_b2_exist_err)
+			return fmt.Errorf("unable to fetch Bucket: %w", safeProviderError(bucket_b2_exist_err))
 		}
 
 		if bucket_b2_exist == nil {
@@ -163,14 +163,15 @@ func (r *BucketReconciler) createOrUpdateBucket(ctx context.Context, bucket *b2v
 				if stderrors.As(bucket_err, &b2err) && b2err.Code == "duplicate_bucket_name" {
 					reason = ReasonDuplicateBucketName
 				}
-				l.Error(bucket_err, "Unable to create bucket at provider", "reason", reason)
+				safeErr := safeProviderError(bucket_err)
+				l.Error(safeErr, "Unable to create bucket at provider", "reason", reason)
 				if r.EventRecorder != nil {
 					r.EventRecorder.Eventf(bucket, corev1.EventTypeWarning, reason,
-						"Failed to create bucket %s: %v", bucket.Name, bucket_err)
+						"Failed to create bucket %s: %v", bucket.Name, safeErr)
 				}
 				r.setReadyCondition(ctx, bucket, metav1.ConditionFalse, reason,
-					fmt.Sprintf("unable to create bucket at provider: %v", bucket_err))
-				return fmt.Errorf("unable to create Bucket: %v", bucket_err)
+					fmt.Sprintf("unable to create bucket at provider: %v", safeErr))
+				return fmt.Errorf("unable to create Bucket: %w", safeErr)
 			}
 
 			if bucket_b2 == nil {
@@ -214,7 +215,7 @@ func (r *BucketReconciler) createOrUpdateBucket(ctx context.Context, bucket *b2v
 
 		bucket_at_b2, err := r.Backblaze.Bucket(bucket.Name)
 		if err != nil {
-			return fmt.Errorf("unable to fetch Bucket: %v", err)
+			return fmt.Errorf("unable to fetch Bucket: %w", safeProviderError(err))
 		}
 
 		if bucket.Spec.AtProvider.Acl != bucket.Status.AtProvider.Acl || !StringSlicesEqual(bucket.Spec.AtProvider.BucketLifecycle, bucket.Status.AtProvider.BucketLifecycle) {
@@ -236,13 +237,14 @@ func (r *BucketReconciler) createOrUpdateBucket(ctx context.Context, bucket *b2v
 
 			update_err := bucket_at_b2.UpdateAll(bucket_acl, make(map[string]string), bucket.Spec.AtProvider.BucketLifecycle, 0)
 			if update_err != nil {
+				safeErr := safeProviderError(update_err)
 				if r.EventRecorder != nil {
 					r.EventRecorder.Eventf(bucket, corev1.EventTypeWarning, ReasonBucketUpdateFailed,
-						"Failed to update bucket %s: %v", bucket.Name, update_err)
+						"Failed to update bucket %s: %v", bucket.Name, safeErr)
 				}
 				r.setReadyCondition(ctx, bucket, metav1.ConditionFalse, ReasonBucketUpdateFailed,
-					fmt.Sprintf("unable to update bucket at provider: %v", update_err))
-				return fmt.Errorf("unable to update Bucket: %v", update_err)
+					fmt.Sprintf("unable to update bucket at provider: %v", safeErr))
+				return fmt.Errorf("unable to update Bucket: %w", safeErr)
 			} else {
 				bucket.Status.AtProvider = bucket.Spec.AtProvider
 				meta.SetStatusCondition(&bucket.Status.Conditions, metav1.Condition{
@@ -270,12 +272,19 @@ func (r *BucketReconciler) createOrUpdateBucket(ctx context.Context, bucket *b2v
 func (r *BucketReconciler) reconcileDelete(ctx context.Context, bucket *b2v1alpha2.Bucket) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 	l.Info("Removing Bucket")
+	if bucket.Spec.DeletionPolicy == "Retain" {
+		controllerutil.RemoveFinalizer(bucket, bucketFinalizer)
+		if err := r.Update(ctx, bucket); err != nil {
+			return ctrl.Result{}, fmt.Errorf("error removing finalizer: %w", err)
+		}
+		return ctrl.Result{}, nil
+	}
 
 	// A transient provider error here must not be mistaken for "bucket already
 	// gone", or the finalizer would be removed and the bucket orphaned at B2.
 	bucket_b2, bucket_b2_err := r.Backblaze.Bucket(bucket.Name)
 	if bucket_b2_err != nil {
-		return ctrl.Result{}, fmt.Errorf("unable to fetch Bucket during deletion: %v", bucket_b2_err)
+		return ctrl.Result{}, fmt.Errorf("unable to fetch Bucket during deletion: %w", safeProviderError(bucket_b2_err))
 	}
 	if bucket_b2 == nil {
 		l.Info("Bucket not found")
@@ -288,14 +297,15 @@ func (r *BucketReconciler) reconcileDelete(ctx context.Context, bucket *b2v1alph
 		// Deleting bucket
 		err := bucket_b2.Delete()
 		if err != nil {
-			l.Error(err, "error occured while trying to remove bucket (is the bucket empty?)")
+			safeErr := safeProviderError(err)
+			l.Error(safeErr, "error occurred while trying to remove bucket (is the bucket empty?)")
 			if r.EventRecorder != nil {
 				r.EventRecorder.Eventf(bucket, corev1.EventTypeWarning, "BucketDeletionFailed",
-					"Failed to delete bucket %s (is the bucket empty?): %v", bucket.Name, err)
+					"Failed to delete bucket %s (is the bucket empty?): %v", bucket.Name, safeErr)
 			}
 			// Returning the error requeues the deletion with backoff instead of
 			// leaving the resource stuck silently with its finalizer in place.
-			return ctrl.Result{}, fmt.Errorf("unable to delete Bucket: %v", err)
+			return ctrl.Result{}, fmt.Errorf("unable to delete Bucket: %w", safeErr)
 		}
 		// Remove the finalizer and update the object
 		controllerutil.RemoveFinalizer(bucket, bucketFinalizer)

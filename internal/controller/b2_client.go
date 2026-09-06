@@ -10,13 +10,21 @@ const ConditionTypeReady = "Ready"
 
 // Reasons used in the Ready condition.
 const (
-	ReasonReconciled          = "Reconciled"
-	ReasonBucketNotFound      = "BucketNotFound"
-	ReasonProviderError       = "ProviderError"
-	ReasonKeyCreationFailed   = "KeyCreationFailed"
-	ReasonBucketCreateFailed  = "BucketCreationFailed"
-	ReasonDuplicateBucketName = "DuplicateBucketName"
-	ReasonBucketUpdateFailed  = "BucketUpdateFailed"
+	ReasonReconciled           = "Reconciled"
+	ReasonBucketNotFound       = "BucketNotFound"
+	ReasonProviderError        = "ProviderError"
+	ReasonKeyCreationFailed    = "KeyCreationFailed"
+	ReasonBucketCreateFailed   = "BucketCreationFailed"
+	ReasonDuplicateBucketName  = "DuplicateBucketName"
+	ReasonBucketUpdateFailed   = "BucketUpdateFailed"
+	ReasonInvalidSpec          = "InvalidSpec"
+	ReasonSecretConflict       = "SecretConflict"
+	ReasonSecretMissing        = "SecretMissing"
+	ReasonSecretInvalid        = "SecretInvalid"
+	ReasonKeyCreating          = "KeyCreating"
+	ReasonKeyRotating          = "KeyRotating"
+	ReasonKeyCreationUncertain = "KeyCreationUncertain"
+	ReasonSecretWriteFailed    = "SecretWriteFailed"
 )
 
 // B2Client is the subset of the go-backblaze API used by the reconcilers.

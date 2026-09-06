@@ -28,12 +28,13 @@ type WriteConnectionSecretToRef struct {
 	Name string `json:"name,omitempty"`
 }
 
-// KeySpec defines the desired state of Key
+// KeySpecAtProvider defines the desired state of a provider application key.
 type KeySpecAtProvider struct {
 	// List of capabilities that key should have. Available options: "listKeys", "writeKeys", "deleteKeys", "listAllBucketNames", "listBuckets", "readBuckets", "writeBuckets", "deleteBuckets", "readBucketRetentions", "writeBucketRetentions", "readBucketEncryption", "writeBucketEncryption", "listFiles", "readFiles", "shareFiles", "writeFiles", "deleteFiles", "readFileLegalHolds", "writeFileLegalHolds", "readFileRetentions", "writeFileRetentions", "bypassGovernance"
 	Capabilities []string `json:"capabilities,omitempty"`
 	// When provided, the key will expire after the given number of seconds, and will have expirationTimestamp set. Value must be a positive integer, and must be less than 1000 days (in seconds).
 	// +kubebuilder:validation:Type=integer
+	// +kubebuilder:validation:Minimum:=1
 	// +kubebuilder:validation:Maximum:=86400000
 	ValidDurationInSeconds int `json:"validDurationInSeconds,omitempty"`
 	// Name of bucket to which key should have access. Leave empty to allow access to all buckets on account.
@@ -47,6 +48,7 @@ type KeySpecAtProvider struct {
 // KeySpec defines the desired state of Key
 type KeySpec struct {
 	// Define configuration at provider (https://www.backblaze.com/apidocs/b2-create-key)
+	// +kubebuilder:validation:XValidation:rule="!has(self.namePrefix) || size(self.namePrefix) == 0 || (has(self.bucketName) && size(self.bucketName) > 0) || (has(self.bucketId) && size(self.bucketId) > 0)",message="namePrefix requires bucketName or bucketId"
 	AtProvider KeySpecAtProvider `json:"atProvider,omitempty"`
 	//+kubebuilder:validation:Optional
 	// Set where operator should save connection credentials.

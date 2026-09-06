@@ -17,7 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
@@ -43,6 +47,13 @@ import (
 )
 
 const keyFinalizer = "key.b2.issei.space/finalizer"
+
+const (
+	defaultKeySecretName        = "b2-secret"
+	keySecretSpecHashAnnotation = "b2.issei.space/key-spec-hash"
+	retryKeyCreationAnnotation  = "b2.issei.space/retry-creation"
+	uncertainCreationMessage    = "Application key creation may have succeeded, but no credential receipt is available. Verify and delete any provider key created for this resource, then set b2.issei.space/retry-creation=true to retry."
+)
 
 // KeyReconciler reconciles a Key object
 type KeyReconciler struct {
@@ -117,228 +128,440 @@ func (r *KeyReconciler) reconcileCreate(ctx context.Context, key *b2v1alpha2.Key
 
 func (r *KeyReconciler) createKeySecret(ctx context.Context, key *b2v1alpha2.Key, appkey *backblaze.ApplicationKeyResponse) error {
 	l := log.FromContext(ctx)
+	secretName := keySecretName(key)
 
-	// Determine secret name - use default if not specified
-	secretName := key.Spec.WriteConnectionSecretToRef.Name
-	if secretName == "" {
-		secretName = "b2-secret"
-		l.Info("WriteConnectionSecretToRef.Name not specified, using default secret name", "secretName", secretName)
-	}
-
-	// Secret data
 	secretData := map[string][]byte{
 		"bucketName": []byte(key.Spec.AtProvider.BucketName),
 		"endpoint":   []byte(fmt.Sprintf("s3.%s.backblazeb2.com", string(os.Getenv("B2_REGION")))),
 		"keyName":    []byte(appkey.KeyName),
-		// AWS S3 compatibile variables
+		// AWS S3 compatible variables
 		"AWS_ACCESS_KEY_ID":     []byte(appkey.ApplicationKeyId),
 		"AWS_SECRET_ACCESS_KEY": []byte(appkey.ApplicationKey),
 	}
-
-	// Check if secret exist
-	secret := &corev1.Secret{}
-	err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: key.Namespace}, secret)
+	hash, err := keySpecHash(key.Spec.AtProvider)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			l.Info("Not found existing secret... creating new")
-			secret = &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      secretName,
-					Namespace: key.Namespace,
-				},
-				Data: secretData,
-			}
-			if err := r.Create(ctx, secret); err != nil {
-				l.Error(err, "Failed to create new Secret", "Secret.Namespace", secret.Namespace, "Secret.Name", secret.Name)
-				return fmt.Errorf("failed to create secret: %w", err)
-			}
-			return nil
-		}
-		return fmt.Errorf("failed to get secret: %w", err)
+		return err
 	}
-
-	// Secret exists, skip overwriting
-	l.Info("Found existing secret, skipping overwrite to preserve existing data", "Secret.Namespace", secret.Namespace, "Secret.Name", secret.Name)
-	if r.EventRecorder != nil {
-		r.EventRecorder.Eventf(key, corev1.EventTypeWarning, "SecretAlreadyExists",
-			"Secret %s/%s already exists and was not overwritten to preserve existing data. If you want to update the secret, delete it first or use a different name.",
-			secret.Namespace, secret.Name)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        secretName,
+			Namespace:   key.Namespace,
+			Annotations: map[string]string{keySecretSpecHashAnnotation: hash},
+		},
+		Data: secretData,
+	}
+	if err := controllerutil.SetControllerReference(key, secret, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set Secret owner: %w", err)
+	}
+	if err := r.Create(ctx, secret); err != nil {
+		l.Error(err, "Failed to create Secret", "Secret.Namespace", secret.Namespace, "Secret.Name", secret.Name)
+		return fmt.Errorf("failed to create Secret: %w", err)
 	}
 	return nil
 }
 
 func (r *KeyReconciler) createOrUpdateKey(ctx context.Context, key *b2v1alpha2.Key) error {
 	l := log.FromContext(ctx)
-	l.Info("create or update key")
-
-	// Check if the key exists
 	if err := r.Get(ctx, types.NamespacedName{Name: key.Name, Namespace: key.Namespace}, key); err != nil {
 		if !errors.IsNotFound(err) {
-			return fmt.Errorf("unable to fetch Key: %v", err)
+			return fmt.Errorf("unable to fetch Key: %w", err)
 		}
 	}
 
-	// If key was not already reconciled (most likely new CR)
-	if !key.Status.Reconciled || key.Status.ToRecreate {
-		l.Info("Key is not reconciled")
-		var b2_bucket_id string
-		var createKeyRequest *backblaze.CreateKeyRequest
+	if key.Spec.AtProvider.NamePrefix != "" && key.Spec.AtProvider.BucketName == "" && key.Spec.AtProvider.BucketId == "" {
+		msg := "namePrefix requires bucketName or bucketId"
+		r.setReadyCondition(ctx, key, metav1.ConditionFalse, ReasonInvalidSpec, msg)
+		return fmt.Errorf("invalid Key spec: %s", msg)
+	}
 
-		if key.Spec.AtProvider.BucketName != "" || key.Spec.AtProvider.BucketId != "" {
-			// If bucketName or bucketId is defined, creating key will defined bucketId
-			if key.Spec.AtProvider.BucketName != "" {
-				bucket_b2, bucket_b2_err := r.Backblaze.Bucket(key.Spec.AtProvider.BucketName)
-				if bucket_b2_err != nil {
-					l.Error(bucket_b2_err, "Failed to fetch bucket at provider")
-					r.setReadyCondition(ctx, key, metav1.ConditionFalse, ReasonProviderError,
-						fmt.Sprintf("unable to fetch bucket %q at provider: %v", key.Spec.AtProvider.BucketName, bucket_b2_err))
-					return fmt.Errorf("unable to fetch bucket %q at provider: %w", key.Spec.AtProvider.BucketName, bucket_b2_err)
-				}
-				if bucket_b2 == nil {
-					// Bucket() returns (nil, nil) when the bucket does not exist on the account,
-					// e.g. it was not created yet or its creation failed (duplicate name).
-					// Returning an error requeues the Key with backoff until the bucket appears.
-					msg := fmt.Sprintf("bucket %q not found at provider (not created yet, or name unavailable)", key.Spec.AtProvider.BucketName)
-					l.Info(msg)
-					if r.EventRecorder != nil {
-						r.EventRecorder.Eventf(key, corev1.EventTypeWarning, ReasonBucketNotFound,
-							"Bucket %s referenced by Key does not exist at provider", key.Spec.AtProvider.BucketName)
-					}
-					r.setReadyCondition(ctx, key, metav1.ConditionFalse, ReasonBucketNotFound, msg)
-					return fmt.Errorf("%s", msg)
-				}
-				b2_bucket_id = bucket_b2.ID
-			} else {
-				b2_bucket_id = key.Spec.AtProvider.BucketId
-			}
-
-			createKeyRequest = &backblaze.CreateKeyRequest{
-				KeyName:      key.Name,
-				Capabilities: key.Spec.AtProvider.Capabilities,
-				BucketId:     b2_bucket_id,
-			}
-		} else {
-			// If bucketName or bucketId is not defined, creating key that have access to all buckets
-			createKeyRequest = &backblaze.CreateKeyRequest{
-				KeyName:      key.Name,
-				Capabilities: key.Spec.AtProvider.Capabilities,
-			}
-		}
-
-		// Create application key
-		applicationKeyCreate, err := r.Backblaze.CreateApplicationKey(createKeyRequest)
-
-		if err != nil {
-			l.Error(err, "Unable to create application key at provider")
-			if r.EventRecorder != nil {
-				r.EventRecorder.Eventf(key, corev1.EventTypeWarning, ReasonKeyCreationFailed,
-					"Failed to create application key for %s: %v", key.Name, err)
-			}
-			r.setReadyCondition(ctx, key, metav1.ConditionFalse, ReasonKeyCreationFailed,
-				fmt.Sprintf("unable to create application key at provider: %v", err))
-			return fmt.Errorf("unable to create application key at provider: %w", err)
-		}
-		if applicationKeyCreate == nil {
-			msg := fmt.Sprintf("provider returned no application key and no error for %q", key.Name)
-			r.setReadyCondition(ctx, key, metav1.ConditionFalse, ReasonKeyCreationFailed, msg)
-			return fmt.Errorf("%s", msg)
-		}
-
-		if applicationKeyCreate.ApplicationKeyId != "" {
-			l.Info("Got application key id from provider, creating secret")
-			if err := r.createKeySecret(ctx, key, applicationKeyCreate); err != nil {
-				l.Error(err, "Failed to create or update Secret")
+	if key.Status.Reconciled {
+		if !reflect.DeepEqual(key.Spec.AtProvider, key.Status.AtProvider) {
+			if err := r.ensureSecretOwnedForRotation(ctx, key); err != nil {
 				return err
 			}
-		}
-
-		// Saving reconcilation and provider config
-		key.Status.Reconciled = true
-		key.Status.ToRecreate = false
-		key.Status.AtProvider = key.Spec.AtProvider
-		key.Status.KeyId = applicationKeyCreate.ApplicationKeyId
-		meta.SetStatusCondition(&key.Status.Conditions, metav1.Condition{
-			Type:               ConditionTypeReady,
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: key.Generation,
-			Reason:             ReasonReconciled,
-			Message:            "Key reconciled at provider",
-		})
-		if err := r.Status().Update(ctx, key); err != nil {
-			return fmt.Errorf("failed to update Key status: %w", err)
-		}
-	} else {
-		// reconciling loop
-		l.Info("Key is reconciled")
-		if !reflect.DeepEqual(key.Spec.AtProvider, key.Status.AtProvider) && !key.Status.ToRecreate {
-			l.Info("Key resource exist on cluster, updating state")
-			// Updating resource at cluster
 			key.Status.Reconciled = false
 			key.Status.ToRecreate = true
-			if err := r.Status().Update(ctx, key); err != nil {
-				return fmt.Errorf("failed to update Key status: %w", err)
-			}
-
-			// Deleting key
-			if _, err := r.reconcileDelete(ctx, key, false); err != nil {
-				l.Error(err, "Failed to delete key for recreation")
-				return err
-			}
-
-			if keyerr := r.createOrUpdateKey(ctx, key); keyerr != nil {
-				l.Error(keyerr, "Failed to recreate key")
-				return keyerr
-			}
-
+			setKeyCondition(key, metav1.ConditionFalse, ReasonKeyRotating, "Key rotation is in progress")
+			return r.Status().Update(ctx, key)
 		}
+		return r.verifyReadySecret(ctx, key)
 	}
 
+	if key.Status.ToRecreate {
+		if key.Status.KeyId != "" {
+			return r.finishKeyRotation(ctx, key)
+		}
+		return r.recoverOrBlockUncertainCreation(ctx, key)
+	}
+
+	request, err := r.createKeyRequest(ctx, key)
+	if err != nil {
+		return err
+	}
+	if recovered, err := r.recoverFromSecret(ctx, key); err != nil || recovered {
+		return err
+	}
+
+	key.Status.AtProvider = key.Spec.AtProvider
+	key.Status.ToRecreate = true
+	setKeyCondition(key, metav1.ConditionFalse, ReasonKeyCreating, "Application key creation is in progress")
+	if err := r.Status().Update(ctx, key); err != nil {
+		return fmt.Errorf("failed to record Key creation state: %w", err)
+	}
+
+	applicationKey, err := r.Backblaze.CreateApplicationKey(request)
+	if err != nil {
+		safeErr := safeProviderError(err)
+		l.Error(safeErr, "Unable to create application key at provider")
+		if isDefinitiveProviderRejection(err) {
+			key.Status.ToRecreate = false
+			setKeyCondition(key, metav1.ConditionFalse, ReasonKeyCreationFailed, safeErr.Error())
+			if statusErr := r.Status().Update(ctx, key); statusErr != nil {
+				return fmt.Errorf("%v; failed to update Key status: %w", safeErr, statusErr)
+			}
+		} else {
+			setKeyCondition(key, metav1.ConditionFalse, ReasonKeyCreationUncertain, uncertainCreationMessage)
+			if statusErr := r.Status().Update(ctx, key); statusErr != nil {
+				return fmt.Errorf("%v; failed to update Key status: %w", safeErr, statusErr)
+			}
+		}
+		return fmt.Errorf("unable to create application key: %w", safeErr)
+	}
+	if applicationKey == nil || applicationKey.ApplicationKeyId == "" {
+		setKeyCondition(key, metav1.ConditionFalse, ReasonKeyCreationUncertain, uncertainCreationMessage)
+		if statusErr := r.Status().Update(ctx, key); statusErr != nil {
+			return fmt.Errorf("provider returned incomplete application key; failed to update Key status: %w", statusErr)
+		}
+		return fmt.Errorf("provider returned incomplete application key; %s", uncertainCreationMessage)
+	}
+	if applicationKey.ApplicationKey == "" {
+		return r.handleSecretPublicationFailure(ctx, key, applicationKey.ApplicationKeyId, fmt.Errorf("provider returned no application key secret"))
+	}
+
+	if err := r.createKeySecret(ctx, key, applicationKey); err != nil {
+		return r.handleSecretPublicationFailure(ctx, key, applicationKey.ApplicationKeyId, err)
+	}
+
+	key.Status.Reconciled = true
+	key.Status.ToRecreate = false
+	key.Status.AtProvider = key.Spec.AtProvider
+	key.Status.KeyId = applicationKey.ApplicationKeyId
+	condition := meta.FindStatusCondition(key.Status.Conditions, ConditionTypeReady)
+	if condition != nil && condition.Status == metav1.ConditionTrue && condition.Reason == ReasonReconciled && condition.ObservedGeneration == key.Generation {
+		return nil
+	}
+	setKeyCondition(key, metav1.ConditionTrue, ReasonReconciled, "Key and credential Secret reconciled")
+	if err := r.Status().Update(ctx, key); err != nil {
+		return fmt.Errorf("failed to update Key status: %w", err)
+	}
 	return nil
 }
 
-func (r *KeyReconciler) reconcileDelete(ctx context.Context, key *b2v1alpha2.Key, deleteSecret bool) (ctrl.Result, error) {
+func (r *KeyReconciler) createKeyRequest(ctx context.Context, key *b2v1alpha2.Key) (*backblaze.CreateKeyRequest, error) {
+	bucketID := key.Spec.AtProvider.BucketId
+	if key.Spec.AtProvider.BucketName != "" {
+		bucket, err := r.Backblaze.Bucket(key.Spec.AtProvider.BucketName)
+		if err != nil {
+			safeErr := safeProviderError(err)
+			log.FromContext(ctx).Error(safeErr, "Failed to fetch bucket at provider")
+			r.setReadyCondition(ctx, key, metav1.ConditionFalse, ReasonProviderError, safeErr.Error())
+			return nil, fmt.Errorf("unable to fetch bucket at provider: %w", safeErr)
+		}
+		if bucket == nil {
+			msg := "referenced bucket was not found at provider"
+			if r.EventRecorder != nil {
+				r.EventRecorder.Event(key, corev1.EventTypeWarning, ReasonBucketNotFound, msg)
+			}
+			r.setReadyCondition(ctx, key, metav1.ConditionFalse, ReasonBucketNotFound, msg)
+			return nil, fmt.Errorf("%s", msg)
+		}
+		bucketID = bucket.ID
+	}
 
+	return &backblaze.CreateKeyRequest{
+		KeyName:                key.Name,
+		Capabilities:           key.Spec.AtProvider.Capabilities,
+		ValidDurationInSeconds: key.Spec.AtProvider.ValidDurationInSeconds,
+		BucketId:               bucketID,
+		NamePrefix:             key.Spec.AtProvider.NamePrefix,
+	}, nil
+}
+
+func (r *KeyReconciler) recoverFromSecret(ctx context.Context, key *b2v1alpha2.Key) (bool, error) {
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: keySecretName(key), Namespace: key.Namespace}, secret)
+	if errors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to get credential Secret: %w", err)
+	}
+	if !secretReceiptMatches(key, secret) {
+		return false, r.recordSecretConflict(ctx, key)
+	}
+
+	key.Status.Reconciled = true
+	key.Status.ToRecreate = false
+	key.Status.AtProvider = key.Spec.AtProvider
+	key.Status.KeyId = string(secret.Data["AWS_ACCESS_KEY_ID"])
+	setKeyCondition(key, metav1.ConditionTrue, ReasonReconciled, "Recovered Key status from credential Secret")
+	if err := r.Status().Update(ctx, key); err != nil {
+		return false, fmt.Errorf("failed to recover Key status: %w", err)
+	}
+	return true, nil
+}
+
+func (r *KeyReconciler) recoverOrBlockUncertainCreation(ctx context.Context, key *b2v1alpha2.Key) error {
+	if recovered, err := r.recoverFromSecret(ctx, key); err != nil || recovered {
+		return err
+	}
+	if key.Annotations[retryKeyCreationAnnotation] == "true" {
+		delete(key.Annotations, retryKeyCreationAnnotation)
+		if err := r.Update(ctx, key); err != nil {
+			return fmt.Errorf("failed to consume retry annotation: %w", err)
+		}
+		key.Status.ToRecreate = false
+		setKeyCondition(key, metav1.ConditionFalse, ReasonKeyCreating, "Explicit retry accepted")
+		if err := r.Status().Update(ctx, key); err != nil {
+			return fmt.Errorf("failed to reset Key creation state: %w", err)
+		}
+		return nil
+	}
+
+	setKeyCondition(key, metav1.ConditionFalse, ReasonKeyCreationUncertain, uncertainCreationMessage)
+	if err := r.Status().Update(ctx, key); err != nil {
+		return fmt.Errorf("failed to update uncertain Key status: %w", err)
+	}
+	return fmt.Errorf("application key creation outcome is uncertain; explicit recovery is required")
+}
+
+func (r *KeyReconciler) verifyReadySecret(ctx context.Context, key *b2v1alpha2.Key) error {
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: keySecretName(key), Namespace: key.Namespace}, secret)
+	if errors.IsNotFound(err) {
+		key.Status.Reconciled = false
+		key.Status.ToRecreate = true
+		setKeyCondition(key, metav1.ConditionFalse, ReasonSecretMissing, "Credential Secret is missing; controlled key rotation is pending")
+		return r.Status().Update(ctx, key)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get credential Secret: %w", err)
+	}
+
+	owned := metav1.IsControlledBy(secret, key)
+	if !owned && !legacySecretMatches(key, secret) {
+		return r.recordSecretConflict(ctx, key)
+	}
+	hash, err := keySpecHash(key.Spec.AtProvider)
+	if err != nil {
+		return err
+	}
+	valid := bytes.Equal(secret.Data["AWS_ACCESS_KEY_ID"], []byte(key.Status.KeyId)) &&
+		len(secret.Data["AWS_SECRET_ACCESS_KEY"]) > 0 &&
+		bytes.Equal(secret.Data["keyName"], []byte(key.Name)) &&
+		(secret.Annotations[keySecretSpecHashAnnotation] == "" || secret.Annotations[keySecretSpecHashAnnotation] == hash)
+	if !valid {
+		key.Status.Reconciled = false
+		key.Status.ToRecreate = true
+		setKeyCondition(key, metav1.ConditionFalse, ReasonSecretInvalid, "Credential Secret does not match provider state; controlled key rotation is pending")
+		return r.Status().Update(ctx, key)
+	}
+
+	changed := false
+	if !owned {
+		if err := controllerutil.SetControllerReference(key, secret, r.Scheme); err != nil {
+			return fmt.Errorf("failed to adopt legacy credential Secret: %w", err)
+		}
+		changed = true
+	}
+	if secret.Annotations == nil {
+		secret.Annotations = map[string]string{}
+	}
+	if secret.Annotations[keySecretSpecHashAnnotation] != hash {
+		secret.Annotations[keySecretSpecHashAnnotation] = hash
+		changed = true
+	}
+	if changed {
+		if err := r.Update(ctx, secret); err != nil {
+			return fmt.Errorf("failed to adopt credential Secret: %w", err)
+		}
+	}
+	setKeyCondition(key, metav1.ConditionTrue, ReasonReconciled, "Key and credential Secret reconciled")
+	if err := r.Status().Update(ctx, key); err != nil {
+		return fmt.Errorf("failed to update Key status: %w", err)
+	}
+	return nil
+}
+
+func (r *KeyReconciler) ensureSecretOwnedForRotation(ctx context.Context, key *b2v1alpha2.Key) error {
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: keySecretName(key), Namespace: key.Namespace}, secret)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get credential Secret: %w", err)
+	}
+	if !metav1.IsControlledBy(secret, key) && !legacySecretMatches(key, secret) {
+		return r.recordSecretConflict(ctx, key)
+	}
+	if !metav1.IsControlledBy(secret, key) {
+		if err := controllerutil.SetControllerReference(key, secret, r.Scheme); err != nil {
+			return fmt.Errorf("failed to adopt legacy credential Secret: %w", err)
+		}
+		if err := r.Update(ctx, secret); err != nil {
+			return fmt.Errorf("failed to adopt legacy credential Secret: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *KeyReconciler) finishKeyRotation(ctx context.Context, key *b2v1alpha2.Key) error {
+	// If desired and observed specs match, this state came from a failed
+	// credential publication or missing Secret. Preserve any unrelated Secret.
+	preserveUnrelated := reflect.DeepEqual(key.Status.AtProvider, key.Spec.AtProvider)
+	if err := r.deleteKeySecret(ctx, key, preserveUnrelated); err != nil {
+		return err
+	}
+	if _, err := r.Backblaze.DeleteApplicationKey(key.Status.KeyId); err != nil && !isProviderNotFound(err) {
+		safeErr := safeProviderError(err)
+		setKeyCondition(key, metav1.ConditionFalse, ReasonKeyRotating, safeErr.Error())
+		if statusErr := r.Status().Update(ctx, key); statusErr != nil {
+			return fmt.Errorf("%v; failed to update Key status: %w", safeErr, statusErr)
+		}
+		return fmt.Errorf("failed to revoke application key during rotation: %w", safeErr)
+	}
+
+	key.Status.KeyId = ""
+	key.Status.Reconciled = false
+	key.Status.ToRecreate = false
+	setKeyCondition(key, metav1.ConditionFalse, ReasonKeyRotating, "Previous application key revoked; replacement is pending")
+	if err := r.Status().Update(ctx, key); err != nil {
+		return fmt.Errorf("failed to record application key revocation: %w", err)
+	}
+	return nil
+}
+
+func (r *KeyReconciler) handleSecretPublicationFailure(ctx context.Context, key *b2v1alpha2.Key, keyID string, publicationErr error) error {
+	_, deleteErr := r.Backblaze.DeleteApplicationKey(keyID)
+	if deleteErr != nil && !isProviderNotFound(deleteErr) {
+		safeErr := safeProviderError(deleteErr)
+		key.Status.KeyId = keyID
+		setKeyCondition(key, metav1.ConditionFalse, ReasonSecretWriteFailed, "Credential Secret publication failed; provider key cleanup is pending")
+		if statusErr := r.Status().Update(ctx, key); statusErr != nil {
+			return fmt.Errorf("failed to create credential Secret; %v; failed to record provider key for cleanup: %w", safeErr, statusErr)
+		}
+		return fmt.Errorf("failed to create credential Secret; provider cleanup also failed: %w", safeErr)
+	}
+
+	key.Status.KeyId = ""
+	key.Status.ToRecreate = false
+	setKeyCondition(key, metav1.ConditionFalse, ReasonSecretWriteFailed, "Credential Secret publication failed; created provider key was revoked")
+	if statusErr := r.Status().Update(ctx, key); statusErr != nil {
+		return fmt.Errorf("%v; failed to reset Key status: %w", publicationErr, statusErr)
+	}
+	return publicationErr
+}
+
+func (r *KeyReconciler) deleteKeySecret(ctx context.Context, key *b2v1alpha2.Key, preserveUnrelated bool) error {
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: keySecretName(key), Namespace: key.Namespace}, secret)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get credential Secret during deletion: %w", err)
+	}
+	if !metav1.IsControlledBy(secret, key) && !legacySecretMatches(key, secret) {
+		if preserveUnrelated {
+			log.FromContext(ctx).Info("Preserving credential Secret not owned by Key", "Secret.Namespace", secret.Namespace, "Secret.Name", secret.Name)
+			return nil
+		}
+		return r.recordSecretConflict(ctx, key)
+	}
+	if err := r.Delete(ctx, secret); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete credential Secret: %w", err)
+	}
+	return nil
+}
+
+func (r *KeyReconciler) recordSecretConflict(ctx context.Context, key *b2v1alpha2.Key) error {
+	message := "Credential Secret already exists but is not a valid receipt owned by this Key; it was not changed"
+	if r.EventRecorder != nil {
+		r.EventRecorder.Event(key, corev1.EventTypeWarning, ReasonSecretConflict, message)
+	}
+	setKeyCondition(key, metav1.ConditionFalse, ReasonSecretConflict, message)
+	if err := r.Status().Update(ctx, key); err != nil {
+		return fmt.Errorf("%s; failed to update Key status: %w", message, err)
+	}
+	return fmt.Errorf("%s", message)
+}
+
+func keySecretName(key *b2v1alpha2.Key) string {
+	if key.Spec.WriteConnectionSecretToRef.Name != "" {
+		return key.Spec.WriteConnectionSecretToRef.Name
+	}
+	return defaultKeySecretName
+}
+
+func keySpecHash(spec b2v1alpha2.KeySpecAtProvider) (string, error) {
+	serialized, err := json.Marshal(spec)
+	if err != nil {
+		return "", fmt.Errorf("failed to hash Key spec: %w", err)
+	}
+	sum := sha256.Sum256(serialized)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func secretReceiptMatches(key *b2v1alpha2.Key, secret *corev1.Secret) bool {
+	hash, err := keySpecHash(key.Spec.AtProvider)
+	return err == nil && metav1.IsControlledBy(secret, key) &&
+		secret.Annotations[keySecretSpecHashAnnotation] == hash &&
+		len(secret.Data["AWS_ACCESS_KEY_ID"]) > 0 &&
+		len(secret.Data["AWS_SECRET_ACCESS_KEY"]) > 0 &&
+		bytes.Equal(secret.Data["keyName"], []byte(key.Name))
+}
+
+func legacySecretMatches(key *b2v1alpha2.Key, secret *corev1.Secret) bool {
+	return metav1.GetControllerOf(secret) == nil && key.Status.KeyId != "" &&
+		bytes.Equal(secret.Data["AWS_ACCESS_KEY_ID"], []byte(key.Status.KeyId)) &&
+		bytes.Equal(secret.Data["keyName"], []byte(key.Name)) &&
+		len(secret.Data["AWS_SECRET_ACCESS_KEY"]) > 0
+}
+
+func setKeyCondition(key *b2v1alpha2.Key, status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&key.Status.Conditions, metav1.Condition{
+		Type:               ConditionTypeReady,
+		Status:             status,
+		ObservedGeneration: key.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+func (r *KeyReconciler) reconcileDelete(ctx context.Context, key *b2v1alpha2.Key, deleteSecret bool) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 	l.Info("Removing Key")
 
 	if deleteSecret {
-		// Determine secret name - use default if not specified
-		secretName := key.Spec.WriteConnectionSecretToRef.Name
-		if secretName == "" {
-			secretName = "b2-secret"
+		if err := r.deleteKeySecret(ctx, key, true); err != nil {
+			return ctrl.Result{}, err
 		}
+	}
 
-		// Retriving existing secret
-		existing_secret := &corev1.Secret{}
-		if err := r.Client.Get(ctx, types.NamespacedName{
-			Name:      secretName,
-			Namespace: key.Namespace},
-			existing_secret,
-		); err != nil {
-			l.Info("Failed to get existing secret at cluster")
-		} else {
-			// Remove secret
-			if err := r.Delete(ctx, existing_secret); err != nil {
-				l.Error(err, "Failed to remove secret")
-			} else {
-				l.Info("Deleted secret at cluster")
+	if key.Status.KeyId != "" {
+		if _, err := r.Backblaze.DeleteApplicationKey(key.Status.KeyId); err != nil {
+			if !isProviderNotFound(err) {
+				safeErr := safeProviderError(err)
+				l.Error(safeErr, "Failed to delete application key")
+				return ctrl.Result{}, fmt.Errorf("failed to delete application key: %w", safeErr)
 			}
 		}
 	}
 
-	// Deleting application key on b2, if one was ever created
-	if key.Status.KeyId != "" {
-		if _, err := r.Backblaze.DeleteApplicationKey(key.Status.KeyId); err != nil {
-			l.Error(err, "Failed to delete application key")
-		} else {
-			l.Info("Deleted Application Key at provider")
-		}
-	}
-
-	// Remove the finalizer and update the object
 	controllerutil.RemoveFinalizer(key, keyFinalizer)
 	if err := r.Update(ctx, key); err != nil {
-		return ctrl.Result{}, fmt.Errorf("error removing finalizer: %v", err)
+		return ctrl.Result{}, fmt.Errorf("error removing finalizer: %w", err)
 	}
 
 	return ctrl.Result{}, nil
@@ -375,6 +598,7 @@ func (r *KeyReconciler) keysForBucket(ctx context.Context, obj client.Object) []
 func (r *KeyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&b2v1alpha2.Key{}).
+		Owns(&corev1.Secret{}).
 		Watches(&b2v1alpha2.Bucket{}, handler.EnqueueRequestsFromMapFunc(r.keysForBucket)).
 		// A panic (e.g. from an unexpected provider response deep in the B2
 		// library) becomes a reconcile error with backoff instead of

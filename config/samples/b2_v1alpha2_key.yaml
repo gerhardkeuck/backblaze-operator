@@ -11,6 +11,8 @@ metadata:
 spec:
   atProvider:
     bucketName: my-b2-bucket
+    namePrefix: sample/
+    validDurationInSeconds: 86400
     capabilities:
       - listAllBucketNames
       - listBuckets

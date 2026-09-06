@@ -40,6 +40,11 @@ type BucketSpecAtProvider struct {
 // BucketSpec defines the desired state of Bucket
 type BucketSpec struct {
 	AtProvider BucketSpecAtProvider `json:"atProvider"`
+	// DeletionPolicy controls whether deleting this resource also deletes the
+	// provider bucket. Existing resources default to Delete for compatibility.
+	// +kubebuilder:validation:Enum=Delete;Retain
+	// +kubebuilder:default=Delete
+	DeletionPolicy string `json:"deletionPolicy,omitempty"`
 }
 
 // BucketStatus defines the observed state of Bucket

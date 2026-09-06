@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -16,10 +17,35 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	b2v1alpha2 "github.com/mgruszkiewicz/backblaze-operator/api/v1alpha2"
 )
+
+type secretDeleteFailingClient struct {
+	client.Client
+	err error
+}
+
+func (c *secretDeleteFailingClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if _, ok := obj.(*corev1.Secret); ok {
+		return c.err
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
+
+type secretCreateFailingClient struct {
+	client.Client
+	err error
+}
+
+func (c *secretCreateFailingClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if _, ok := obj.(*corev1.Secret); ok {
+		return c.err
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
 
 func newKeyReconciler(fake *fakeB2, recorder record.EventRecorder) *KeyReconciler {
 	return &KeyReconciler{
@@ -114,7 +140,7 @@ var _ = Describe("Key controller", func() {
 	It("returns an error and reports KeyCreationFailed when the provider rejects the key", func() {
 		fake := &fakeB2{
 			bucket:       &backblaze.Bucket{BucketInfo: &backblaze.BucketInfo{ID: "bucket-id-1", Name: "some-bucket"}},
-			createKeyErr: &backblaze.B2Error{Code: "bad_request", Message: "invalid capability", Status: 400},
+			createKeyErr: &backblaze.B2Error{Code: "bad_request", Message: "sensitive-test-marker", Status: 400},
 		}
 		r := newKeyReconciler(fake, nil)
 
@@ -127,12 +153,14 @@ var _ = Describe("Key controller", func() {
 		_, err = reconcileKey(r, "key-create-failed")
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("unable to create application key"))
+		Expect(err.Error()).NotTo(ContainSubstring("sensitive-test-marker"))
 
 		key = getKey("key-create-failed")
 		Expect(key.Status.Reconciled).To(BeFalse())
 		cond := meta.FindStatusCondition(key.Status.Conditions, ConditionTypeReady)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Reason).To(Equal(ReasonKeyCreationFailed))
+		Expect(cond.Message).NotTo(ContainSubstring("sensitive-test-marker"))
 	})
 
 	It("creates the key and its secret when the bucket exists", func() {
@@ -167,6 +195,46 @@ var _ = Describe("Key controller", func() {
 		Expect(secret.Data).To(HaveKeyWithValue("AWS_ACCESS_KEY_ID", []byte("app-key-id-1")))
 		Expect(secret.Data).To(HaveKeyWithValue("AWS_SECRET_ACCESS_KEY", []byte("app-key-secret")))
 		Expect(secret.Data).To(HaveKeyWithValue("bucketName", []byte("existing-bucket")))
+		Expect(metav1.IsControlledBy(secret, key)).To(BeTrue())
+	})
+
+	It("forwards the exact prefix, expiry, bucket and capabilities to the provider", func() {
+		fake := &fakeB2{
+			bucket: &backblaze.Bucket{BucketInfo: &backblaze.BucketInfo{ID: "bucket-id-request", Name: "request-bucket"}},
+			createKeyResp: &backblaze.ApplicationKeyResponse{
+				KeyName:          "key-request",
+				ApplicationKeyId: "request-key-id",
+				ApplicationKey:   "test-only-secret",
+			},
+		}
+		key := newKey("key-request", "request-bucket", "secret-key-request")
+		key.Spec.AtProvider.NamePrefix = "woodpecker/"
+		key.Spec.AtProvider.ValidDurationInSeconds = 3600
+		Expect(k8sClient.Create(ctx, key)).To(Succeed())
+
+		_, err := reconcileKey(newKeyReconciler(fake, nil), "key-request")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconcileKey(newKeyReconciler(fake, nil), "key-request")
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(fake.createdKeyRequests).To(HaveLen(1))
+		Expect(fake.createdKeyRequests[0]).To(Equal(&backblaze.CreateKeyRequest{
+			KeyName:                "key-request",
+			Capabilities:           []string{"listBuckets", "listFiles"},
+			ValidDurationInSeconds: 3600,
+			BucketId:               "bucket-id-request",
+			NamePrefix:             "woodpecker/",
+		}))
+	})
+
+	It("rejects a prefix without a bucket before calling the provider", func() {
+		fake := &fakeB2{}
+		key := newKey("key-invalid-prefix", "", "secret-key-invalid-prefix")
+		key.Spec.AtProvider.NamePrefix = "woodpecker/"
+
+		err := newKeyReconciler(fake, nil).createOrUpdateKey(ctx, key)
+		Expect(err).To(MatchError(ContainSubstring("namePrefix requires bucketName or bucketId")))
+		Expect(fake.createdKeyRequests).To(BeEmpty())
 	})
 
 	It("creates an all-buckets key when no bucket is referenced", func() {
@@ -189,6 +257,179 @@ var _ = Describe("Key controller", func() {
 
 		Expect(getKey("key-all-buckets").Status.Reconciled).To(BeTrue())
 		Expect(fake.createdKeyNames).To(ContainElement("key-all-buckets"))
+	})
+
+	It("rotates provider credentials and replaces only its owned Secret", func() {
+		fake := &fakeB2{
+			bucket: &backblaze.Bucket{BucketInfo: &backblaze.BucketInfo{ID: "bucket-id-rotate", Name: "rotate-bucket"}},
+			createKeyResp: &backblaze.ApplicationKeyResponse{
+				KeyName:          "key-rotate",
+				ApplicationKeyId: "old-key-id",
+				ApplicationKey:   "old-test-secret",
+			},
+		}
+		r := newKeyReconciler(fake, nil)
+		key := newKey("key-rotate", "rotate-bucket", "secret-key-rotate")
+		Expect(k8sClient.Create(ctx, key)).To(Succeed())
+		_, err := reconcileKey(r, "key-rotate")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconcileKey(r, "key-rotate")
+		Expect(err).NotTo(HaveOccurred())
+
+		key = getKey("key-rotate")
+		key.Spec.AtProvider.NamePrefix = "keycloak/"
+		key.Spec.AtProvider.ValidDurationInSeconds = 7200
+		Expect(k8sClient.Update(ctx, key)).To(Succeed())
+		fake.createKeyResp = &backblaze.ApplicationKeyResponse{
+			KeyName:          "key-rotate",
+			ApplicationKeyId: "new-key-id",
+			ApplicationKey:   "new-test-secret",
+		}
+
+		_, err = reconcileKey(r, "key-rotate") // mark rotation
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconcileKey(r, "key-rotate") // revoke old key and delete old Secret
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconcileKey(r, "key-rotate") // create replacement and Secret
+		Expect(err).NotTo(HaveOccurred())
+
+		key = getKey("key-rotate")
+		Expect(key.Status.Reconciled).To(BeTrue())
+		Expect(key.Status.KeyId).To(Equal("new-key-id"))
+		Expect(fake.deletedKeyIds).To(ContainElement("old-key-id"))
+		Expect(fake.createdKeyRequests).To(HaveLen(2))
+		Expect(fake.createdKeyRequests[1].NamePrefix).To(Equal("keycloak/"))
+		Expect(fake.createdKeyRequests[1].ValidDurationInSeconds).To(Equal(7200))
+
+		secret := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "secret-key-rotate", Namespace: "default"}, secret)).To(Succeed())
+		Expect(secret.Data).To(HaveKeyWithValue("AWS_ACCESS_KEY_ID", []byte("new-key-id")))
+		Expect(secret.Data).To(HaveKeyWithValue("AWS_SECRET_ACCESS_KEY", []byte("new-test-secret")))
+		Expect(metav1.IsControlledBy(secret, key)).To(BeTrue())
+	})
+
+	It("does not overwrite or revoke for a Secret owned by another resource", func() {
+		fake := &fakeB2{
+			createKeyResp: &backblaze.ApplicationKeyResponse{
+				KeyName:          "key-secret-conflict",
+				ApplicationKeyId: "should-not-be-created",
+				ApplicationKey:   "test-only-secret",
+			},
+		}
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "shared-secret", Namespace: "default"},
+			Data:       map[string][]byte{"preserved": []byte("value")},
+		}
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		key := newKey("key-secret-conflict", "", "shared-secret")
+		Expect(k8sClient.Create(ctx, key)).To(Succeed())
+		r := newKeyReconciler(fake, nil)
+		_, err := reconcileKey(r, "key-secret-conflict")
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconcileKey(r, "key-secret-conflict")
+		Expect(err).To(HaveOccurred())
+
+		Expect(fake.createdKeyRequests).To(BeEmpty())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "shared-secret", Namespace: "default"}, secret)).To(Succeed())
+		Expect(secret.Data).To(HaveKeyWithValue("preserved", []byte("value")))
+		cond := meta.FindStatusCondition(getKey("key-secret-conflict").Status.Conditions, ConditionTypeReady)
+		Expect(cond.Reason).To(Equal(ReasonSecretConflict))
+	})
+
+	It("recovers status from an owned Secret receipt without creating a duplicate provider key", func() {
+		fake := &fakeB2{}
+		r := newKeyReconciler(fake, nil)
+		key := newKey("key-recover-receipt", "", "secret-key-recover-receipt")
+		controllerutil.AddFinalizer(key, keyFinalizer)
+		Expect(k8sClient.Create(ctx, key)).To(Succeed())
+		key = getKey("key-recover-receipt")
+		key.Status.ToRecreate = true
+		key.Status.AtProvider = key.Spec.AtProvider
+		Expect(k8sClient.Status().Update(ctx, key)).To(Succeed())
+		Expect(r.createKeySecret(ctx, key, &backblaze.ApplicationKeyResponse{
+			KeyName:          key.Name,
+			ApplicationKeyId: "receipt-key-id",
+			ApplicationKey:   "receipt-test-secret",
+		})).To(Succeed())
+
+		_, err := reconcileKey(r, key.Name)
+		Expect(err).NotTo(HaveOccurred())
+		key = getKey(key.Name)
+		Expect(key.Status.Reconciled).To(BeTrue())
+		Expect(key.Status.KeyId).To(Equal("receipt-key-id"))
+		Expect(fake.createdKeyRequests).To(BeEmpty())
+	})
+
+	It("fails closed after an uncertain provider create without a Secret receipt", func() {
+		fake := &fakeB2{}
+		key := newKey("key-uncertain-create", "", "secret-key-uncertain-create")
+		controllerutil.AddFinalizer(key, keyFinalizer)
+		Expect(k8sClient.Create(ctx, key)).To(Succeed())
+		key = getKey(key.Name)
+		key.Status.ToRecreate = true
+		key.Status.AtProvider = key.Spec.AtProvider
+		Expect(k8sClient.Status().Update(ctx, key)).To(Succeed())
+
+		_, err := reconcileKey(newKeyReconciler(fake, nil), key.Name)
+		Expect(err).To(HaveOccurred())
+		Expect(fake.createdKeyRequests).To(BeEmpty())
+		cond := meta.FindStatusCondition(getKey(key.Name).Status.Conditions, ConditionTypeReady)
+		Expect(cond.Reason).To(Equal(ReasonKeyCreationUncertain))
+	})
+
+	It("revokes a newly created provider key when Secret publication fails", func() {
+		fake := &fakeB2{
+			createKeyResp: &backblaze.ApplicationKeyResponse{
+				KeyName:          "key-secret-create-fails",
+				ApplicationKeyId: "unpublished-key-id",
+				ApplicationKey:   "test-only-secret",
+			},
+		}
+		r := newKeyReconciler(fake, nil)
+		key := newKey("key-secret-create-fails", "", "secret-key-create-fails")
+		Expect(k8sClient.Create(ctx, key)).To(Succeed())
+		_, err := reconcileKey(r, key.Name)
+		Expect(err).NotTo(HaveOccurred())
+		r.Client = &secretCreateFailingClient{Client: k8sClient, err: stderrors.New("injected Secret create failure")}
+
+		_, err = reconcileKey(r, key.Name)
+		Expect(err).To(HaveOccurred())
+		Expect(fake.deletedKeyIds).To(ContainElement("unpublished-key-id"))
+		key = getKey(key.Name)
+		Expect(key.Status.Reconciled).To(BeFalse())
+		Expect(key.Status.ToRecreate).To(BeFalse())
+		cond := meta.FindStatusCondition(key.Status.Conditions, ConditionTypeReady)
+		Expect(cond.Reason).To(Equal(ReasonSecretWriteFailed))
+	})
+
+	It("repairs a missing owned Secret through controlled rotation", func() {
+		fake := &fakeB2{
+			createKeyResp: &backblaze.ApplicationKeyResponse{KeyName: "key-missing-secret", ApplicationKeyId: "missing-old-id", ApplicationKey: "old-test-secret"},
+		}
+		r := newKeyReconciler(fake, nil)
+		key := newKey("key-missing-secret", "", "secret-key-missing-secret")
+		Expect(k8sClient.Create(ctx, key)).To(Succeed())
+		_, err := reconcileKey(r, key.Name)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconcileKey(r, key.Name)
+		Expect(err).NotTo(HaveOccurred())
+		secret := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "secret-key-missing-secret", Namespace: "default"}, secret)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
+
+		_, err = reconcileKey(r, key.Name) // detect missing Secret
+		Expect(err).NotTo(HaveOccurred())
+		cond := meta.FindStatusCondition(getKey(key.Name).Status.Conditions, ConditionTypeReady)
+		Expect(cond.Reason).To(Equal(ReasonSecretMissing))
+		fake.createKeyResp = &backblaze.ApplicationKeyResponse{KeyName: key.Name, ApplicationKeyId: "missing-new-id", ApplicationKey: "new-test-secret"}
+		_, err = reconcileKey(r, key.Name) // revoke old key
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconcileKey(r, key.Name) // create replacement
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(fake.deletedKeyIds).To(ContainElement("missing-old-id"))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "secret-key-missing-secret", Namespace: "default"}, secret)).To(Succeed())
+		Expect(secret.Data).To(HaveKeyWithValue("AWS_ACCESS_KEY_ID", []byte("missing-new-id")))
 	})
 
 	It("maps Bucket events to pending Keys referencing that bucket", func() {
@@ -241,6 +482,52 @@ var _ = Describe("Key controller", func() {
 		err = k8sClient.Get(ctx, types.NamespacedName{Name: "key-delete", Namespace: "default"}, &b2v1alpha2.Key{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue(), fmt.Sprintf("expected Key to be gone, got: %v", err))
 		err = k8sClient.Get(ctx, types.NamespacedName{Name: "secret-key-delete", Namespace: "default"}, &corev1.Secret{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	It("keeps the finalizer when credential Secret deletion fails", func() {
+		fake := &fakeB2{
+			createKeyResp: &backblaze.ApplicationKeyResponse{KeyName: "key-secret-delete-fails", ApplicationKeyId: "delete-secret-id", ApplicationKey: "test-only-secret"},
+		}
+		r := newKeyReconciler(fake, nil)
+		key := newKey("key-secret-delete-fails", "", "secret-key-delete-fails")
+		Expect(k8sClient.Create(ctx, key)).To(Succeed())
+		_, err := reconcileKey(r, key.Name)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconcileKey(r, key.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Delete(ctx, getKey(key.Name))).To(Succeed())
+
+		r.Client = &secretDeleteFailingClient{Client: k8sClient, err: stderrors.New("injected Secret delete failure")}
+		_, err = reconcileKey(r, key.Name)
+		Expect(err).To(HaveOccurred())
+		Expect(controllerutil.ContainsFinalizer(getKey(key.Name), keyFinalizer)).To(BeTrue())
+		Expect(fake.deleteKeyCalls).To(BeEmpty())
+	})
+
+	It("keeps the finalizer on provider deletion failure and treats confirmed NotFound as success", func() {
+		fake := &fakeB2{
+			createKeyResp: &backblaze.ApplicationKeyResponse{KeyName: "key-provider-delete-fails", ApplicationKeyId: "delete-provider-id", ApplicationKey: "test-only-secret"},
+		}
+		r := newKeyReconciler(fake, nil)
+		key := newKey("key-provider-delete-fails", "", "secret-key-provider-delete-fails")
+		Expect(k8sClient.Create(ctx, key)).To(Succeed())
+		_, err := reconcileKey(r, key.Name)
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconcileKey(r, key.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Delete(ctx, getKey(key.Name))).To(Succeed())
+
+		fake.deleteKeyErr = &backblaze.B2Error{Code: "service_unavailable", Message: "contains-sensitive-provider-detail", Status: 503}
+		_, err = reconcileKey(r, key.Name)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).NotTo(ContainSubstring("contains-sensitive-provider-detail"))
+		Expect(controllerutil.ContainsFinalizer(getKey(key.Name), keyFinalizer)).To(BeTrue())
+
+		fake.deleteKeyErr = &backblaze.B2Error{Code: "not_found", Message: "contains-sensitive-provider-detail", Status: 404}
+		_, err = reconcileKey(r, key.Name)
+		Expect(err).NotTo(HaveOccurred())
+		err = k8sClient.Get(ctx, types.NamespacedName{Name: key.Name, Namespace: "default"}, &b2v1alpha2.Key{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
 })
